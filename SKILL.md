@@ -276,13 +276,32 @@ curl -s -X POST \
 
 ### 前置条件
 
-1. **Secret Manager** 中已创建以下 secret：
+1. **GCP API 已启用**（否则会报 `API [...] not enabled on project`）：
+   ```bash
+   gcloud services enable secretmanager.googleapis.com --project=my-project-openclaw-492614
+   gcloud services enable run.googleapis.com --project=my-project-openclaw-492614
+   gcloud services enable cloudbuild.googleapis.com --project=my-project-openclaw-492614
+   ```
+
+2. **Secret Manager** 中已创建以下 secret：
    - `DB_PASSWORD`：数据库密码
    - `JWT_SECRET`：JWT 签名密钥
+   ```bash
+   echo -n "你的密码" | gcloud secrets create DB_PASSWORD --data-file=- --project=my-project-openclaw-492614
+   echo -n "你的JWT密钥" | gcloud secrets create JWT_SECRET --data-file=- --project=my-project-openclaw-492614
+   ```
 
-2. **deploy-bot** 已授予以下 IAM 角色：
+3. **deploy-bot** IAM 角色：
    - `roles/secretmanager.secretAccessor`（读取 secrets）
    - `roles/run.admin`（部署 Cloud Run）
+   - `roles/cloudbuild.builds.create`（创建触发器）
+   ```bash
+   gcloud secrets add-iam-policy-binding DB_PASSWORD \
+     --member=serviceAccount:deploy-bot@my-project-openclaw-492614.iam.gserviceaccount.com \
+     --role=roles/secretmanager.secretAccessor --project=my-project-openclaw-492614
+   ```
+
+> **踩坑记录**：IAM 角色已配不代表 API 可用——Secret Manager API 必须先在 GCP Console 或通过 `gcloud services enable` 启用，否则报 `API has not been used ... or it is disabled`。
 
 ---
 
