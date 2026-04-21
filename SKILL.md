@@ -4,6 +4,26 @@ description: |
   从需求到上线的全栈开发自动化框架。覆盖：需求分析、架构设计、子 Agent 并行开发、GitHub push、Cloud Build 触发器创建（REST API）、自动化部署、监控告警、回滚机制。
   触发场景：新建项目、做一个完整系统、从零到一、帮我开发整个项目、完整流程
   触发短语：新项目、从零开发、做一个全栈项目、帮我开发、完整系统
+tags:
+  - fullstack
+  - gcp
+  - cloud-run
+  - cloud-build
+  - flutter
+  - spring-boot
+  - nodejs
+  - observability
+  - ci-cd
+related_skills:
+  - github-pr-workflow
+  - cloud-run-deploy
+  - database-migration
+  - monitoring
+usage_hint: |
+  当用户说"新项目"、"从零开发"、"做一个完整系统"、"帮我开发"、"完整流程"时触发本技能。
+  完整流程：需求分析(SPEC.md) → 技术选型 → 并行开发(前端+后端subagent) → GitHub push
+    → 创建触发器(REST API) → Cloud Build 构建 → 部署 Cloud Run → Smoke Test
+    → 配置监控告警(OTel+Cloud Monitoring) → 返回访问链接。
 ---
 
 # 全栈开发自动化框架 🚀
@@ -237,9 +257,16 @@ frontend/
 
 ## ④ Cloud Build 触发器创建（REST API）
 
-**必须用 REST API，CLI 有 bug 无法创建。**
+> **推荐使用 `references/create-trigger.sh` 脚本**，自动处理 REST API 调用和参数构造，幂等设计。
+> ```bash
+> chmod +x references/create-trigger.sh
+> # 后端触发器
+> ./references/create-trigger.sh backend <project-name> FgqGH <repo-name>
+> # 前端触发器
+> ./references/create-trigger.sh frontend <project-name> FgqGH <repo-name>
+> ```
 
-### 创建触发器
+### 手动 REST API（仅参考）
 
 ```bash
 curl -s -X POST \
@@ -267,10 +294,10 @@ curl -s -X POST \
       "_AR_REPO": "asia-east1-docker.pkg.dev/my-project-openclaw-492614",
       "_IMAGE_PREFIX": "{project-name}",
       "_SERVICE_NAME": "{service-name}",
-      "_DB_HOST": "my-project-openclaw",
-      "_DB_PORT": "5432",
-      "_DB_NAME": "appdb",
-      "_DB_USERNAME": "appuser"
+      "_DB_HOST": "${_DB_HOST}",
+      "_DB_PORT": "${_DB_PORT}",
+      "_DB_NAME": "${_DB_NAME}",
+      "_DB_USERNAME": "${_DB_USERNAME}"
     }
   }'
 ```
@@ -284,7 +311,8 @@ curl -s -X POST \
 | HTML/JS 前端触发器 | `{project}-frontend-push` | includes: `frontend/**`, excludes: `backend/**` | `frontend/cloudbuild.yaml` |
 
 > **路径过滤**：必须设置 `pathFilters`，避免后端代码变更触发前端构建，或反之。
-> **Substitutions**：`_DB_HOST` 等变量通过 Cloud Build 的 substitution 传递，明文不泄露。
+> **Substitutions**：`_DB_HOST` 等变量通过 Cloud Build substitution 传递（实际值来自 gcp-init.sh 创建的 Cloud SQL 实例）。
+> **注意**：必须用 REST API 创建触发器，CLI 有 bug 无法创建。
 > **自动化脚本**：`scripts/gcp-init.sh` 用于初始化基础环境，`references/create-trigger.sh` 用于自动化创建触发器。
 
 ---

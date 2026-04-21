@@ -49,8 +49,6 @@ else
   exit 1
 fi
 
-TOKEN="$(gcloud auth print-access-token)"
-
 log_info() { echo "[INFO]  $*"; }
 log_ok()   { echo "[OK]   $*"; }
 
@@ -58,12 +56,11 @@ log_info "创建触发器: $TRIGGER_NAME"
 log_info "仓库: $REPO_OWNER/$REPO_NAME"
 log_info "路径过滤: includes=$INCLUDE_PATH, excludes=$EXCLUDE_PATH"
 
-# 调用 Cloud Build REST API
-RESPONSE=$(curl -s -X POST \
-  "https://cloudbuild.googleapis.com/v1/projects/${PROJECT_ID}/locations/global/triggers" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "$(cat <<EOF
+# 获取 access token（不在字符串中展开，避免二次解析问题）
+TOKEN="$(gcloud auth print-access-token)"
+
+# 构造 JSON payload
+PAYLOAD=$(cat <<EOF
 {
   "name": "${TRIGGER_NAME}",
   "github": {
@@ -92,7 +89,14 @@ RESPONSE=$(curl -s -X POST \
   }
 }
 EOF
-)")"
+)
+
+# 调用 Cloud Build REST API
+RESPONSE=$(curl -s -X POST \
+  "https://cloudbuild.googleapis.com/v1/projects/${PROJECT_ID}/locations/global/triggers" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "${PAYLOAD}")
 
 TRIGGER_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || echo "")
 
