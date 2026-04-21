@@ -25,6 +25,7 @@ description: |
 - **Token**: `{{GITHUB_TOKEN}}`
 - **仓库创建**: 通过 GitHub API `POST /user/repos`
 - **代码推送**: `git remote set-url` + `git push`
+- **触发器脚本**: `references/create-trigger.sh`
 
 ### GCP
 - **Project ID**: `my-project-openclaw-492614`
@@ -32,6 +33,7 @@ description: |
 - **Artifact Registry**: `asia-east1-docker.pkg.dev/my-project-openclaw-492614`
 - **deploy-bot**: `deploy-bot@my-project-openclaw-492614.iam.gserviceaccount.com`
 - **构建触发器创建**: 通过 Cloud Build REST API（CLI 有 bug，必须用 REST）
+- **环境初始化**: `scripts/gcp-init.sh`（首次使用前运行一次）
 
 ---
 
@@ -40,25 +42,30 @@ description: |
 ```
 强哥：提需求
     ↓
-① 需求分析 → 输出 SPEC.md
+① 需求分析 → 输出 SPEC.md + openapi.yaml
     ↓
 ② 技术选型
     ├─ 简单信息展示 → HTML/JS + Node.js 后端
     └─ 复杂多角色 → Flutter Web + Spring Boot 后端
     ↓
 ③ 派 subagent 并行开发
-    ├─ 子 Agent A → 后端代码
-    └─ 子 Agent B → 前端代码
+    ├─ 子 Agent A → 后端代码 + 单元测试 + 集成测试
+    └─ 子 Agent B → 前端代码 + Widget Test + Integration Test
     ↓
 ④ GitHub push 触发器创建（REST API，路径过滤）
     ↓
 ⑤ Cloud Build 自动构建
-    ├─ 后端：Maven/Node → Docker → Cloud Run
-    └─ 前端：Flutter SDK → Docker(Nginx) → Cloud Run
+    ├─ 后端：Contract Test → Maven/Node 测试（含覆盖率）→ Docker → Cloud Run
+    └─ 前端：Flutter Build → Widget Test → Lighthouse CI → Docker → Cloud Run
     ↓
-⑥ 测试验证（smoke test）
+⑥ Smoke Test（失败自动 rollback）
     ↓
-⑦ 配置监控告警（Cloud Monitoring）
+⑦ 配置监控告警（Cloud Monitoring + OTel 可观测性）
+    ├─ 结构化日志（JSON + correlationId）
+    ├─ OpenTelemetry 追踪集成
+    ├─ 告警策略（CPU/错误率/延迟/SLO）
+    ├─ Dashboard 大盘
+    └─ 告警自愈（Smoke Test → Auto Rollback）
     ↓
 ⑧ 返回链接 + 已知限制
 ```
@@ -68,9 +75,9 @@ description: |
 
 ---
 
-## ① 需求分析 → SPEC.md
+## ① 需求分析 → SPEC.md + openapi.yaml
 
-每个项目必须先输出 `SPEC.md`，包含：
+每个项目必须先输出 `SPEC.md` 和 `openapi.yaml`（契约优先）：
 
 ### 内容结构
 
@@ -171,6 +178,8 @@ backend/
 │   ├── application.yml
 │   └── db/migration/  # Flyway SQL
 ├── src/test/java/...
+├── openapi.yaml        # OpenAPI 3.0 契约定义
+├── dredd.yml           # Contract Test 配置
 ├── pom.xml
 ├── Dockerfile
 └── cloudbuild.yaml
@@ -186,6 +195,8 @@ backend/
 │   ├── services/       # 业务逻辑
 │   ├── middleware/      # JWT 认证
 │   └── types/          # TypeScript 类型
+├── openapi.yaml        # OpenAPI 3.0 契约定义
+├── dredd.yml           # Contract Test 配置
 ├── package.json
 ├── tsconfig.json
 ├── Dockerfile
@@ -251,54 +262,81 @@ curl -s -X POST \
     "serviceAccount": "projects/my-project-openclaw-492614/serviceAccounts/deploy-bot@my-project-openclaw-492614.iam.gserviceaccount.com",
     "filename": "{cloudbuild-yaml-path}",
     "substitutions": {
-      "_DB_HOST": "${_DB_HOST}",
-      "_DB_PORT": "${_DB_PORT}",
-      "_DB_NAME": "${_DB_NAME}",
-      "_DB_USERNAME": "${_DB_USERNAME}"
+      "_PROJECT_NAME": "{project-name}",
+      "_REGION": "asia-east1",
+      "_AR_REPO": "asia-east1-docker.pkg.dev/my-project-openclaw-492614",
+      "_IMAGE_PREFIX": "{project-name}",
+      "_SERVICE_NAME": "{service-name}",
+      "_DB_HOST": "my-project-openclaw",
+      "_DB_PORT": "5432",
+      "_DB_NAME": "appdb",
+      "_DB_USERNAME": "appuser"
     }
   }'
 ```
 
 ### 触发器名称规范
 
-| 项目类型 | 触发器名称 | 路径过滤 |
-|---------|-----------|---------|
-| 后端触发器 | `{project}-github-push` | includes: `backend/**`, excludes: `frontend/**` |
-| Flutter 前端触发器 | `{project}-frontend-push` | includes: `frontend/**`, excludes: `backend/**` |
-| HTML/JS 前端触发器 | `{project}-frontend-push` | includes: `frontend/**`, excludes: `backend/**` |
+| 项目类型 | 触发器名称 | 路径过滤 | cloudbuild.yaml |
+|---------|-----------|---------|----------------|
+| 后端触发器 | `{project}-backend-push` | includes: `backend/**`, excludes: `frontend/**` | `backend/cloudbuild.yaml` |
+| Flutter 前端触发器 | `{project}-frontend-push` | includes: `frontend/**`, excludes: `backend/**` | `frontend/cloudbuild.yaml` |
+| HTML/JS 前端触发器 | `{project}-frontend-push` | includes: `frontend/**`, excludes: `backend/**` | `frontend/cloudbuild.yaml` |
 
 > **路径过滤**：必须设置 `pathFilters`，避免后端代码变更触发前端构建，或反之。
 > **Substitutions**：`_DB_HOST` 等变量通过 Cloud Build 的 substitution 传递，明文不泄露。
+> **自动化脚本**：`scripts/gcp-init.sh` 用于初始化基础环境，`references/create-trigger.sh` 用于自动化创建触发器。
 
 ---
 
 ## ⑤ cloudbuild.yaml 标准模板
 
-### 前置条件
+### 前置条件（环境初始化）
 
-1. **GCP API 已启用**（否则会报 `API [...] not enabled on project`）：
+> **推荐使用自动化脚本**：首次部署前运行一次 `scripts/gcp-init.sh` 即可完成所有初始化，幂等设计，重复运行安全。
+> ```bash
+> chmod +x scripts/gcp-init.sh
+> ./scripts/gcp-init.sh my-project-openclaw-492614
+> ```
+
+手动步骤（供参考，不推荐逐条执行）：
+1. **启用 GCP API**：
    ```bash
-   gcloud services enable secretmanager.googleapis.com --project=my-project-openclaw-492614
-   gcloud services enable run.googleapis.com --project=my-project-openclaw-492614
-   gcloud services enable cloudbuild.googleapis.com --project=my-project-openclaw-492614
+   gcloud services enable secretmanager.googleapis.com run.googleapis.com \
+     cloudbuild.googleapis.com sqladmin.googleapis.com monitoring.googleapis.com \
+     artifactregistry.googleapis.com --project=my-project-openclaw-492614
    ```
 
-2. **Secret Manager** 中已创建以下 secret：
-   - `DB_PASSWORD`：数据库密码
-   - `JWT_SECRET`：JWT 签名密钥
+2. **创建 Service Account**：
    ```bash
-   echo -n "你的密码" | gcloud secrets create DB_PASSWORD --data-file=- --project=my-project-openclaw-492614
-   echo -n "你的JWT密钥" | gcloud secrets create JWT_SECRET --data-file=- --project=my-project-openclaw-492614
+   gcloud iam service-accounts create deploy-bot \
+     --display-name="Deploy Bot for CI/CD" --project=my-project-openclaw-492614
    ```
 
-3. **deploy-bot** IAM 角色：
-   - `roles/secretmanager.secretAccessor`（读取 secrets）
-   - `roles/run.admin`（部署 Cloud Run）
-   - `roles/cloudbuild.builds.create`（创建触发器）
+3. **授予 IAM 角色**（deploy-bot 需要）：
+   - `roles/artifactregistry.admin`
+   - `roles/run.admin`
+   - `roles/cloudsql.admin`
+   - `roles/storage.objectAdmin`
+   - `roles/secretmanager.secretAccessor`
+   - `roles/monitoring.admin`
+   - `roles/logging.admin`
+
+4. **创建 Secrets**（JWT_SECRET / DB_PASSWORD）并授予 deploy-bot secretAccessor 权限：
    ```bash
-   gcloud secrets add-iam-policy-binding DB_PASSWORD \
-     --member=serviceAccount:deploy-bot@my-project-openclaw-492614.iam.gserviceaccount.com \
-     --role=roles/secretmanager.secretAccessor --project=my-project-openclaw-492614
+   # 创建 secrets
+   echo -n "$(openssl rand -base64 32)" | gcloud secrets create JWT_SECRET --data-file=- --project=my-project-openclaw-492614
+   echo -n "$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)" | gcloud secrets create DB_PASSWORD --data-file=- --project=my-project-openclaw-492614
+   # 授权
+   gcloud secrets add-iam-policy-binding JWT_SECRET --member=serviceAccount:deploy-bot@my-project-openclaw-492614.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor --project=my-project-openclaw-492614
+   gcloud secrets add-iam-policy-binding DB_PASSWORD --member=serviceAccount:deploy-bot@my-project-openclaw-492614.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor --project=my-project-openclaw-492614
+   ```
+
+5. **配置 Artifact Registry**：
+   ```bash
+   gcloud artifacts repositories create asia-east1-docker-repo \
+     --repository-format=docker --location=asia-east1 --project=my-project-openclaw-492614
+   gcloud auth configure-docker asia-east1-docker.pkg.dev --quiet
    ```
 
 > **踩坑记录**：IAM 角色已配不代表 API 可用——Secret Manager API 必须先在 GCP Console 或通过 `gcloud services enable` 启用，否则报 `API has not been used ... or it is disabled`。
@@ -309,14 +347,40 @@ curl -s -X POST \
 
 ```yaml
 steps:
-  # ① 运行测试
+  # 0. 启动 Mock Server（使用 prism）
+  - name: node:20
+    id: Start Mock Server
+    entrypoint: npx
+    args:
+      - "@stoplight/prism"
+      - "mock"
+      - backend/openapi.yaml
+      - "--port"
+      - "4010"
+    background: true
+    waitFor: ["-"]
+
+  # 1. 运行 Contract Test（mock server 启动后才执行）
+  - name: node:20
+    id: Contract Test
+    entrypoint: npx
+    args:
+      - dredd
+      - backend/openapi.yaml
+      - http://localhost:4010
+      - "--config"
+      - backend/dredd.yml
+    waitFor: [Start Mock Server]
+
+  # 2. 运行单元测试
   - name: maven:3.9-eclipse-temurin-17
     id: Test
     entrypoint: mvn
     args: [test, -q]
     dir: backend
+    waitFor: [Contract Test]
 
-  # ② 打包
+  # 3. 打包
   - name: maven:3.9-eclipse-temurin-17
     id: Build Package
     entrypoint: mvn
@@ -324,7 +388,7 @@ steps:
     dir: backend
     waitFor: [Test]
 
-  # ③ 构建 Docker 镜像
+  # 4. 构建 Docker 镜像
   - name: gcr.io/cloud-builders/docker
     id: Build Image
     args:
@@ -336,7 +400,7 @@ steps:
       - backend
     waitFor: [Build Package]
 
-  # ④ 推送镜像
+  # 5. 推送镜像
   - name: gcr.io/cloud-builders/docker
     id: Push Image
     args:
@@ -344,7 +408,7 @@ steps:
       - asia-east1-docker.pkg.dev/my-project-openclaw-492614/{image-prefix}/{service-name}:latest
     waitFor: [Build Image]
 
-  # ⑤ 从 Secret Manager 读取密码（不落地磁盘）
+  # 6. 从 Secret Manager 读取密码（不落地磁盘）
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: Read Secrets
     entrypoint: bash
@@ -360,7 +424,7 @@ steps:
       - JWT_SECRET
     waitFor: [Push Image]
 
-  # ⑥ 部署（引用 Cloud Build 内置 Secret Manager 支持）
+  # 7. 部署（引用 Cloud Build 内置 Secret Manager 支持）
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: Deploy
     entrypoint: gcloud
@@ -405,21 +469,47 @@ availableSecrets:
 
 ```yaml
 steps:
-  # ① 安装依赖 & 测试
+  # 0. 启动 Mock Server（使用 prism）
+  - name: node:20
+    id: Start Mock Server
+    entrypoint: npx
+    args:
+      - "@stoplight/prism"
+      - "mock"
+      - backend/openapi.yaml
+      - "--port"
+      - "4010"
+    background: true
+    waitFor: ["-"]
+
+  # 1. 运行 Contract Test
+  - name: node:20
+    id: Contract Test
+    entrypoint: npx
+    args:
+      - dredd
+      - backend/openapi.yaml
+      - http://localhost:4010
+      - "--config"
+      - backend/dredd.yml
+    waitFor: [Start Mock Server]
+
+  # 2. 安装依赖 & 单元测试
   - name: node:20
     id: Test
     entrypoint: npm
     args: [install, --prefix, backend, &&, npm, test, --prefix, backend]
     dir: .
+    waitFor: [Contract Test]
 
-  # ② 打包（构建产物）
+  # 3. 打包（构建产物）
   - name: node:20
     id: Build
     entrypoint: npm
     args: [run, build, --prefix, backend]
     waitFor: [Test]
 
-  # ③ Docker 构建
+  # 4. Docker 构建
   - name: gcr.io/cloud-builders/docker
     id: Build Image
     args:
@@ -431,7 +521,7 @@ steps:
       - backend
     waitFor: [Build]
 
-  # ④ 推送
+  # 5. 推送
   - name: gcr.io/cloud-builders/docker
     id: Push Image
     args:
@@ -439,7 +529,7 @@ steps:
       - asia-east1-docker.pkg.dev/my-project-openclaw-492614/{image-prefix}/{service-name}:latest
     waitFor: [Build Image]
 
-  # ⑤ 部署
+  # 6. 部署
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: Deploy
     entrypoint: gcloud
@@ -641,37 +731,67 @@ server {
 
 ## ⑥ 数据库迁移（Flyway）
 
+> **参考文档**：`references/database-migration.md` — 包含完整 Flyway 配置、幂等写法、UNDO rollback、多环境策略、常见错误处理。
+
 ### 规则
 
-- 迁移文件放在 `backend/src/main/resources/db/migration/`
+- 迁移文件放在 `backend/src/main/resources/db/migration/`（Spring Boot）或 `backend/migrations/`（Node.js）
 - 文件命名规范：`V{version}__{description}.sql`（如 `V1__init_users_table.sql`）
-- **生产环境迁移**：Cloud Build 部署前通过额外 step 连接数据库执行 Flyway migrate
-- **禁止手动修改已执行的迁移文件**，新增需求通过新迁移文件实现
+- **生产环境迁移**：Cloud Build 部署前通过 Flyway migrate 执行
+- **禁止手动修改已执行的迁移文件**，新增需求通过新的 migration 文件实现
+- `clean-disabled: true`（生产禁止 clean）
+- 大表数据迁移必须分批（每批 ≤ 10000 行）
 
-### Cloud Build 集成迁移 step
+### Cloud Build 迁移 Step（增强版，含失败 Rollback）
 
-在 `backend/cloudbuild.yaml` 的 Deploy step 之前添加：
+在 `backend/cloudbuild.yaml` 的 Deploy step **之前**添加：
 
 ```yaml
-  # ⑥ 数据库迁移（部署前）
+  # ⑥ 数据库迁移（部署前，失败自动回滚镜像）
   - name: gcr.io/cloud-builders/docker
     id: Flyway Migrate
     entrypoint: bash
     args:
       - -c
       - |
+        set -e
+        echo "Running Flyway migration..."
         docker run --rm \
-          -e FLYWAY_URL=jdbc:mysql://${_DB_HOST}:${_DB_PORT}/${_DB_NAME} \
+          -e FLYWAY_URL="jdbc:mysql://${_DB_HOST}:${_DB_PORT}/${_DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true" \
           -e FLYWAY_USER=${_DB_USERNAME} \
           -e FLYWAY_PASSWORD=$$DB_PASSWORD \
           -v $(pwd)/backend/src/main/resources/db/migration:/flyway/sql \
-          flyway/flyway:9 migrate
+          flyway/flyway:9 migrate || {
+          echo "ERROR: Flyway migration failed, rolling back image..."
+          gcloud run services update-traffic ${SERVICE_NAME} \
+            --region=asia-east1 --to-latest --platform=managed 2>&1 || true
+          exit 1
+        }
+        echo "Migration completed successfully"
     secretEnv:
       - DB_PASSWORD
+    env:
+      - CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/credential.json
     waitFor: [Push Image]
+
+  # ⑥b Schema 版本验证
+  - name: gcr.io/cloud-builders/docker
+    id: Validate Schema
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        docker run --rm \
+          -e FLYWAY_URL="jdbc:mysql://${_DB_HOST}:${_DB_PORT}/${_DB_NAME}?useSSL=false" \
+          -e FLYWAY_USER=${_DB_USERNAME} \
+          -e FLYWAY_PASSWORD=$$DB_PASSWORD \
+          flyway/flyway:9 info
+    secretEnv:
+      - DB_PASSWORD
+    waitFor: [Flyway Migrate]
 ```
 
-> **fail-fast**：迁移失败则整个 build 失败，不会部署半成品到生产。
+> **fail-fast**：迁移失败则整个 build 失败并回滚镜像，不会部署半成品到生产。
 
 ---
 
@@ -736,74 +856,140 @@ gcloud run services add-iam-policy-binding {service-name} \
 
 ---
 
-## ⑨ 监控告警配置（Cloud Monitoring）
+## ⑨ 监控告警配置（Cloud Monitoring + OTel 可观测性）
 
-### 必做项
+> **参考文档**：`references/observability.md` — 包含完整的结构化日志规范、OTel 追踪配置、告警自愈机制、运维 Runbook 和 SLO 定义。下文为快速执行参考，完整规范见 reference 文档。
 
-部署完成后通过 REST API 创建告警策略：
+### 必做清单（部署后立即执行）
 
+1. 创建通知渠道（Email）
+2. 创建 4 个告警策略：CPU > 80%、错误率 > 1%、延迟 P99 > 2s、内存 > 85%
+3. 配置 Smoke Test + Auto Rollback（cloudbuild.yaml 追加 step）
+4. 创建 Cloud Monitoring Dashboard
+5. 验证告警能收到邮件
+
+### 核心指标
+
+| 指标 | 阈值 | 持续时间 | 级别 | 动作 |
+|------|------|---------|------|------|
+| CPU 使用率 | > 80% | 1min | WARNING | 通知 |
+| CPU 使用率 | > 95% | 1min | CRITICAL | 自动扩容 |
+| 5xx 错误率 | > 1% | 2min | WARNING | 通知 |
+| 5xx 错误率 | > 5% | 1min | CRITICAL | 自动回滚 |
+| 延迟 P99 | > 2s | 2min | WARNING | 通知 |
+| 内存使用率 | > 85% | 3min | WARNING | 通知 |
+
+### 结构化日志（所有服务必须）
+
+JSON 格式，包含字段：`timestamp`、`level`、`message`、`correlationId`、`service`、`traceId`、`spanId`、`userId`、`duration`。
+
+**禁止记录**：`password`、`token`、`secret`、`authorization`、`creditCard`。
+
+### OpenTelemetry 追踪集成
+
+所有后端服务必须集成 OTel SDK，自动生成 traceId/spanId 并注入到日志。
+
+### Smoke Test + Auto Rollback Step
+
+在 cloudbuild.yaml Deploy step **之后**追加：
+
+```yaml
+  # Smoke Test + Auto Rollback
+  - name: curlimages/curl
+    id: Smoke Test
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        SMOKE_URL="${SERVICE_URL}"
+        echo "Waiting 15s for service to be ready..."
+        sleep 15
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$${SMOKE_URL}/health" --max-time 30)
+        echo "Health check returned: $${HTTP_CODE}"
+        if [ "$${HTTP_CODE}" -ge 500 ]; then
+          echo "ERROR: Health check failed, triggering rollback..."
+          gcloud run services update-traffic ${SERVICE_NAME} --region=asia-east1 --to-latest --platform=managed 2>&1
+          exit 1
+        fi
+        echo "Smoke test passed"
+    env:
+      - CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/credential.json
+    waitFor: [Deploy]
+```
+
+### 告警配置（REST API）
+
+**通知渠道**：
 ```bash
-# ① 创建通知渠道
 curl -s -X POST \
   "https://monitoring.googleapis.com/v3/projects/my-project-openclaw-492614/notificationChannels" \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "email",
-    "displayName": "{project}-alerts",
-    "labels": { "email_address": "{alert-email}" }
+    "displayName": "${PROJECT}-ops-email",
+    "labels": { "email_address": "${ALERT_EMAIL}" }
   }'
+```
 
-# ② 创建 CPU 使用率 > 80% 告警
+**CPU > 80% 告警**：
+```bash
 curl -s -X POST \
   "https://monitoring.googleapis.com/v3/projects/my-project-openclaw-492614/alertPolicies" \
   -H "Authorization: Bearer $(gcloud auth print-access-token)" \
   -H "Content-Type: application/json" \
   -d '{
-    "displayName": "{project}-high-cpu",
+    "displayName": "${PROJECT}-cpu-high",
+    "combiner": "OR",
     "conditions": [{
-      "displayName": "CPU Usage > 80%",
+      "displayName": "CPU > 80%",
       "conditionThreshold": {
-        "filter": "resource.type=cloud_run_revision AND resource.labels.service_name={service-name}",
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\"",
         "metric": "run.googleapis.com/container/cpu/utilizations",
         "comparison": "COMPARISON_GT",
         "thresholdValue": 0.8,
         "duration": "60s"
       }
     }],
-    "notificationChannels": ["{channel-id}"]
-  }'
-
-# ③ 创建请求错误率 > 1% 告警
-curl -s -X POST \
-  "https://monitoring.googleapis.com/v3/projects/my-project-openclaw-492614/alertPolicies" \
-  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "displayName": "{project}-high-error-rate",
-    "conditions": [{
-      "displayName": "Error Rate > 1%",
-      "conditionThreshold": {
-        "filter": "resource.type=cloud_run_revision AND resource.labels.service_name={service-name}",
-        "metric": "run.googleapis.com/request_count",
-        "metricFilter": "metric.response_code_class>=500",
-        "comparison": "COMPARISON_GT",
-        "thresholdValue": 0.01,
-        "duration": "60s"
-      }
-    }],
-    "notificationChannels": ["{channel-id}"]
+    "notificationChannels": ["${NOTIFICATION_CHANNEL}"]
   }'
 ```
 
-### 必监控指标
+### Cloud Monitoring Dashboard（可选但推荐）
 
-| 指标 | 阈值 | 动作 |
-|------|------|------|
-| CPU 使用率 | > 80% 持续 1min | 告警 |
-| 请求错误率（5xx） | > 1% 持续 1min | 告警 |
-| 实例数 | = max-instances | 告警（容量满） |
-| 延迟 P99 | > 2s | 告警 |
+```bash
+curl -s -X POST \
+  "https://monitoring.googleapis.com/v3/projects/my-project-openclaw-492614/dashboards" \
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "displayName": "${PROJECT}-Dashboard",
+    "gridLayout": { "columns": 2, "widgets": [
+      { "title": "RPM", "xyChart": { "dataSets": [{ "timeSeriesQuery": { "timeSeriesFilter": { "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\"", "metric": "run.googleapis.com/request_count" } } }] } },
+      { "title": "Error Rate", "xyChart": { "dataSets": [{ "timeSeriesQuery": { "timeSeriesFilter": { "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\" AND metric.labels.response_code_class=\"500\"", "metric": "run.googleapis.com/request_count" } } }] } },
+      { "title": "CPU %", "xyChart": { "dataSets": [{ "timeSeriesQuery": { "timeSeriesFilter": { "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\"", "metric": "run.googleapis.com/container/cpu/utilizations" } } }] } },
+      { "title": "Latency P99", "xyChart": { "dataSets": [{ "timeSeriesQuery": { "timeSeriesFilter": { "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\"", "metric": "run.googleapis.com/request_latencies" }, "secondaryAggregation": { "aggregation": { "reducer": "REDUCE_PERCENTILE", "percentile": 99 } } } }] } }
+    ]}
+  }'
+```
+
+### SLO 定义（每个服务必须）
+
+| SLO | 目标 | 告警阈值 |
+|-----|------|---------|
+| 可用性 | 99.9% | < 99.5% |
+| 延迟 P99 | < 500ms | > 1s |
+| 错误率 | < 0.1% | > 0.5% |
+
+### 运维 Runbook（快速查）
+
+| 告警 | 排查命令 | 常见原因 | 临时缓解 |
+|------|---------|---------|---------|
+| CPU 高 | Cloud Console → Metrics | 死循环/频繁GC/连接池耗尽 | `--max-instances=5` |
+| 延迟 P99 高 | OTel Trace → 最慢 span | 慢查询/第三方API超时 | 检查数据库索引 |
+| 错误率升高 | Cloud Logging → `severity=ERROR` | 新部署问题/外部依赖故障 | 回滚 |
+| 实例数满 | `gcloud run services describe` | 流量突增/爬虫 | 临时提 max-instances |
 
 ---
 
@@ -826,10 +1012,15 @@ curl -s -X POST \
 
 ### 代码质量门禁
 
-合并到 `develop` 前必须通过：
-- `git diff --stat` 检查文件数量异常
-- `git log --oneline -5` 检查提交记录
-- 单元测试覆盖率 > 70%（Java: JaCoCo, JS: Istanbul）
+合并到 `develop` 前必须通过所有质量检查：
+
+- [ ] Contract Test 通过（100% API 路径覆盖）
+- [ ] 单元测试通过（`mvn test` / `npm test` / `flutter test`）
+- [ ] 覆盖率达标（后端 line > 70%，前端 widget test > 50%）
+- [ ] Lighthouse CI Performance > 90（前端子项目）
+- [ ] 没有 `console.error` / 未捕获异常
+- [ ] 没有硬编码的 secrets 或测试数据
+- [ ] `git diff --stat` 文件数量正常（排除 node_modules 等）
 
 ---
 
